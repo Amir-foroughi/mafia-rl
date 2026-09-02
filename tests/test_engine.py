@@ -47,15 +47,32 @@ class EngineTest(unittest.TestCase):
             [p.role for p in other.state.players.values()],
         )
 
-    def test_day_target_range_and_no_self(self) -> None:
+    def test_day_target_allows_zero_three_and_self(self) -> None:
         requests = self.engine.current_requests()
         for player_id, request in requests.items():
             self.assertTrue(request.legal_actions)
+            self.assertIn(DayTarget(()), request.legal_actions)
+            self.assertIn(DayTarget((player_id,)), request.legal_actions)
+            other = tuple(pid for pid in self.engine.state.players if pid != player_id)
+            self.assertIn(DayTarget(tuple(sorted((player_id, *other[:2])))), request.legal_actions)
             for action in request.legal_actions:
                 self.assertIsInstance(action, DayTarget)
-                self.assertNotIn(player_id, action.targets)
-                self.assertGreaterEqual(len(action.targets), 1)
+                self.assertGreaterEqual(len(action.targets), 0)
                 self.assertLessEqual(len(action.targets), 3)
+                self.assertEqual(len(action.targets), len(set(action.targets)))
+
+    def test_day_target_allows_mafia_teammate(self) -> None:
+        mafia = [pid for pid, p in self.engine.state.players.items() if p.role is Role.MAFIA]
+        self.assertIn(DayTarget((mafia[1],)), self.engine.legal_actions(mafia[0]))
+
+    def test_day_target_rejects_dead_duplicate_and_too_many(self) -> None:
+        actor = 0
+        dead = 1
+        self.engine.state.players[dead].alive = False
+        legal = self.engine.legal_actions(actor)
+        self.assertNotIn(DayTarget((dead,)), legal)
+        self.assertNotIn(DayTarget((actor, actor)), legal)
+        self.assertNotIn(DayTarget((0, 2, 3, 4)), legal)
 
     def test_invalid_joint_actor_set_is_rejected(self) -> None:
         requests = self.engine.current_requests()
@@ -64,18 +81,14 @@ class EngineTest(unittest.TestCase):
         with self.assertRaises(InvalidActionError):
             self.engine.step(actions)
 
-    def test_nomination_fallback_includes_self(self) -> None:
-        # Everyone targets player 0, while player 0 targets player 1.
-        actions = {}
-        for pid in self.engine.current_requests():
-            target = 1 if pid == 0 else 0
-            actions[pid] = DayTarget((target,))
-        self.engine.step(actions)
+    def test_nomination_is_independent_and_excludes_self(self) -> None:
+        self.engine.step({pid: DayTarget(()) for pid in self.engine.current_requests()})
         self.assertEqual(self.engine.state.phase, Phase.NOMINATION)
-        # Player 2 has only player 0 linked and must fill the other slot freely.
         legal = self.engine.legal_actions(2)
-        self.assertIn(NominationVote((0, 2)), legal)
-        self.assertTrue(all(0 in action.targets for action in legal))
+        self.assertIn(NominationVote((0, 1)), legal)
+        self.assertIn(NominationVote((8, 9)), legal)
+        self.assertTrue(all(2 not in action.targets for action in legal))
+        self.assertTrue(all(len(action.targets) == len(set(action.targets)) == 2 for action in legal))
 
     def test_final_vote_tie_eliminates_nobody(self) -> None:
         self.engine.state.defendants = (0, 1)
@@ -108,6 +121,32 @@ class EngineTest(unittest.TestCase):
             actions[pid] = RunoffVote((1 if index < 3 else 2,))
         self.engine.step(actions)
         # Vote totals tie; player 1 has more incoming targets and wins.
+        self.assertEqual(self.engine.state.defendants, (0, 1))
+
+    def test_runoff_choices_are_not_limited_by_targeting(self) -> None:
+        self.engine.state.phase = Phase.RUNOFF
+        self.engine.state.locked_defendants = (0,)
+        self.engine.state.runoff_candidates = (1, 2, 3)
+        self.engine.state.runoff_open_seats = 1
+        self.engine.state.day_targets = {4: (9,)}
+        self.assertEqual(
+            set(self.engine.legal_actions(4)),
+            {RunoffVote((1,)), RunoffVote((2,)), RunoffVote((3,))},
+        )
+
+    def test_self_target_counts_in_runoff_tiebreak(self) -> None:
+        self.engine.state.phase = Phase.RUNOFF
+        self.engine.state.locked_defendants = (0,)
+        self.engine.state.runoff_candidates = (1, 2, 3)
+        self.engine.state.runoff_open_seats = 1
+        self.engine.state.original_nomination_totals = {1: 3, 2: 3, 3: 3}
+        self.engine.state.day_targets = {1: (1,)}
+        requests = self.engine.current_requests()
+        actions = {
+            pid: RunoffVote((1 if index % 2 == 0 else 2,))
+            for index, pid in enumerate(requests)
+        }
+        self.engine.step(actions)
         self.assertEqual(self.engine.state.defendants, (0, 1))
 
     def test_mafia_observation_does_not_leak_to_citizen(self) -> None:

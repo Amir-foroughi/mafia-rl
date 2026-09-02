@@ -18,7 +18,7 @@ class GameConfig:
     doctor_count: int = 1
     detective_count: int = 1
     max_days: int = 10
-    schema_version: str = "mafia-mvp-v1"
+    schema_version: str = "mafia-public-actions-v2"
 
     @property
     def player_count(self) -> int:

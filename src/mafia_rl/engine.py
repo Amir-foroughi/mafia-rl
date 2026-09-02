@@ -107,33 +107,28 @@ class GameEngine:
         alive = self._alive_ids()
 
         if kind is DecisionKind.DAY_TARGET:
-            candidates = tuple(pid for pid in alive if pid != player_id)
-            maximum = min(self.public_living_mafia, len(candidates))
+            candidates = alive
+            maximum = min(3, len(candidates))
             return tuple(
                 DayTarget(combo)
-                for size in range(1, maximum + 1)
+                for size in range(0, maximum + 1)
                 for combo in itertools.combinations(candidates, size)
             )
 
         if kind is DecisionKind.NOMINATION:
-            linked = set(self._linked_players(player_id, alive))
-            actions: list[Action] = []
-            for combo in itertools.combinations(alive, 2):
-                required = min(2, len(linked))
-                if len(linked.intersection(combo)) >= required:
-                    actions.append(NominationVote(combo))
-            return tuple(actions)
+            candidates = tuple(pid for pid in alive if pid != player_id)
+            return tuple(
+                NominationVote(combo)
+                for combo in itertools.combinations(candidates, 2)
+            )
 
         if kind is DecisionKind.RUNOFF:
             candidates = self.state.runoff_candidates
             open_seats = self.state.runoff_open_seats
-            linked = set(self._linked_players(player_id, candidates))
-            actions = []
-            for combo in itertools.combinations(candidates, open_seats):
-                required = min(open_seats, len(linked))
-                if len(linked.intersection(combo)) >= required:
-                    actions.append(RunoffVote(combo))
-            return tuple(actions)
+            return tuple(
+                RunoffVote(combo)
+                for combo in itertools.combinations(candidates, open_seats)
+            )
 
         if kind is DecisionKind.DEFENCE_VOTE:
             return tuple(DefenceVote(pid) for pid in self.state.defendants)
@@ -535,20 +530,6 @@ class GameEngine:
             pid: 1.0 if player.alignment is self.state.winner else -1.0
             for pid, player in self.state.players.items()
         }
-
-    def _linked_players(
-        self, player_id: PlayerId, candidates: tuple[PlayerId, ...]
-    ) -> tuple[PlayerId, ...]:
-        own_targets = set(self.state.day_targets.get(player_id, ()))
-        return tuple(
-            candidate
-            for candidate in candidates
-            if candidate != player_id
-            and (
-                candidate in own_targets
-                or player_id in self.state.day_targets.get(candidate, ())
-            )
-        )
 
     def _alive_ids(self) -> tuple[PlayerId, ...]:
         return tuple(
