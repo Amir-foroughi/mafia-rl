@@ -1,4 +1,4 @@
-"""Gymnasium adapter for the first focal-Citizen learning experiment.
+"""Gymnasium adapters for focal and shared-policy Citizen experiments.
 
 Install the ``rl`` project extra to use this module.  The game engine itself
 intentionally remains free of learning-framework dependencies.
@@ -169,7 +169,11 @@ class FocalCitizenEnv(gym.Env):
 
     def _encode_observation(self) -> np.ndarray:
         assert self.focal_player is not None
-        observation = self.engine.observe(self.focal_player)
+        return self._encode_player_observation(self.focal_player)
+
+    def _encode_player_observation(self, player_id: int) -> np.ndarray:
+        """Encode one player's information using the common policy input shape."""
+        observation = self.engine.observe(player_id)
         n = self.config.player_count
         values: list[float] = [
             min(observation.day, self.config.max_days) / self.config.max_days,
@@ -200,3 +204,130 @@ class FocalCitizenEnv(gym.Env):
                 history[event.day - 1, kind, event.actor, int(target)] = 1.0
         values.extend(history.ravel().tolist())
         return np.asarray(values, dtype=np.float32)
+
+
+class SharedCitizenEnv(FocalCitizenEnv):
+    """Turn-based adapter in which all normal Citizens share one policy.
+
+    A Gym step collects one normal Citizen's action.  When every living normal
+    Citizen requested in the current engine phase has acted, their buffered
+    actions are submitted jointly with seeded random actions for all other
+    roles.  Consequently every normal-Citizen decision becomes a transition in
+    the single shared policy's rollout.
+    """
+
+    def __init__(
+        self,
+        config: GameConfig | None = None,
+        *,
+        opponent_factory: OpponentFactory | None = None,
+    ) -> None:
+        super().__init__(config, opponent_factory=opponent_factory)
+        self.controlled_players: tuple[int, ...] = ()
+        self.acting_player: int | None = None
+        self._pending_players: list[int] = []
+        self._pending_actions: dict[int, Action] = {}
+
+    def reset(self, *, seed: int | None = None, options: dict | None = None):
+        gym.Env.reset(self, seed=seed)
+        del options
+        if seed is None:
+            seed = int(self.np_random.integers(0, 2**31 - 1))
+        self._episode_seed = int(seed)
+        self.engine.reset(self._episode_seed)
+        self.controlled_players = tuple(
+            pid for pid, player in self.engine.state.players.items()
+            if player.role is Role.CITIZEN
+        )
+        # Kept for compatibility with existing recorders and analysis files.
+        self.focal_player = self.controlled_players[0]
+        factory = self._opponent_factory or (
+            lambda pid, episode_seed: RandomAgent((episode_seed + 1) * 1_000_003 + pid)
+        )
+        self._opponents = {
+            pid: factory(pid, self._episode_seed)
+            for pid in self.engine.state.players if pid not in self.controlled_players
+        }
+        self._pending_players = []
+        self._pending_actions = {}
+        self.acting_player = None
+        self._advance_to_shared_decision()
+        return self._encode_observation(), self._info()
+
+    def step(self, action: int):
+        if self.acting_player is None:
+            raise RuntimeError("reset() must be called before step()")
+        actor = self.acting_player
+        request = self.engine.current_requests().get(actor)
+        if request is None:
+            raise RuntimeError("the environment is not awaiting the acting Citizen")
+        chosen = self.catalog[int(action)] if self.action_space.contains(action) else None
+        if chosen not in request.legal_actions:
+            raise ValueError(f"masked or out-of-range action: {action}")
+        self._pending_actions[actor] = chosen
+        self._pending_players.pop(0)
+        if self._pending_players:
+            self.acting_player = self._pending_players[0]
+        else:
+            requests = self.engine.current_requests()
+            actions = self._random_actions(requests)
+            actions.update(self._pending_actions)
+            self.engine.step(actions)
+            self._pending_actions = {}
+            self.acting_player = None
+            self._advance_to_shared_decision()
+        terminated = self.engine.state.terminated
+        truncated = self.engine.state.truncated
+        reward = 0.0
+        if terminated:
+            reward = 1.0 if self.engine.state.winner is Alignment.CITIZEN else -1.0
+        return self._encode_observation(), reward, terminated, truncated, self._info()
+
+    def action_masks(self) -> np.ndarray:
+        mask = np.zeros(len(self.catalog), dtype=np.bool_)
+        if self.acting_player is None:
+            return mask
+        request = self.engine.current_requests().get(self.acting_player)
+        if request is not None:
+            for action in request.legal_actions:
+                mask[self._catalog_index[action]] = True
+        return mask
+
+    def _random_actions(self, requests):
+        return {
+            pid: self._opponents[pid].act(self.engine.observe(pid), request)
+            for pid, request in requests.items()
+            if pid not in self.controlled_players
+        }
+
+    def _advance_to_shared_decision(self) -> None:
+        while not (self.engine.state.terminated or self.engine.state.truncated):
+            requests = self.engine.current_requests()
+            controlled = [
+                pid for pid in self.controlled_players
+                if self.engine.state.players[pid].alive and pid in requests
+            ]
+            if controlled:
+                self._pending_players = controlled
+                self.acting_player = controlled[0]
+                return
+            self.engine.step(self._random_actions(requests))
+        self._pending_players = []
+        self.acting_player = None
+
+    def _info(self) -> dict:
+        return {
+            "action_mask": self.action_masks(),
+            "acting_player": self.acting_player,
+            "controlled_players": self.controlled_players,
+            "citizen_mode": "shared",
+            "winner": self.engine.state.winner.value if self.engine.state.winner else None,
+        }
+
+    def _encode_observation(self) -> np.ndarray:
+        # Gymnasium requires a valid terminal observation.  The first controlled
+        # seat is used only after termination, when no further action is taken.
+        player_id = self.acting_player
+        if player_id is None:
+            player_id = self.controlled_players[0]
+        return self._encode_player_observation(player_id)
